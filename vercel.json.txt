@@ -1,0 +1,14 @@
+{
+  "builds": [
+    {
+      "src": "api/processor.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/processor",
+      "dest": "api/processor.py"
+    }
+  ]
+}
