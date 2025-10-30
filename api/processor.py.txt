@@ -1,0 +1,91 @@
+from fastapi import FastAPI, Request
+import httpx
+import os
+from datetime import datetime, timedelta
+from typing import List
+
+app = FastAPI()
+
+SHOPIFY_API_KEY = os.getenv("SHOPIFY_API_KEY")
+SHOPIFY_SHOP = os.getenv("SHOPIFY_SHOP")
+FLOW_SECRET = os.getenv("FLOW_SECRET", "supersecret1234")
+LOCATION_NAME_COL = os.getenv("LOCATION_NAME_COL", "Almacén en Colombia")
+LOCATION_NAME_USA = os.getenv("LOCATION_NAME_USA", "Almacén en USA")
+
+async def get_inventory_levels(product_id):
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"https://{SHOPIFY_SHOP}/admin/api/2024-10/inventory_levels.json?inventory_item_ids={product_id}",
+            headers={"X-Shopify-Access-Token": SHOPIFY_API_KEY},
+        )
+        return res.json()
+
+async def get_orders_last_90d():
+    since = (datetime.utcnow() - timedelta(days=90)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"https://{SHOPIFY_SHOP}/admin/api/2024-10/orders.json?status=any&created_at_min={since}",
+            headers={"X-Shopify-Access-Token": SHOPIFY_API_KEY},
+        )
+        return res.json().get("orders", [])
+
+@app.post("/api/processor")
+async def process_order(request: Request):
+    auth = request.headers.get("authorization")
+    if auth != f"Bearer {FLOW_SECRET}":
+        return {"error": "Unauthorized"}
+
+    data = await request.json()
+    order_raw = data.get("orderRaw", {})
+    order = order_raw if isinstance(order_raw, dict) else {}
+
+    # Obtener todas las órdenes de los últimos 90 días
+    orders = await get_orders_last_90d()
+
+    product_stats = {}
+
+    for o in orders:
+        if o.get("cancelled_at"):
+            continue
+        for item in o.get("line_items", []):
+            pid = item["product_id"]
+            if pid not in product_stats:
+                product_stats[pid] = {"ventas": 0, "clientes": set()}
+            product_stats[pid]["ventas"] += 1
+            product_stats[pid]["clientes"].add(o["email"])
+
+    productos = []
+    for pid, stats in product_stats.items():
+        ventas = stats["ventas"]
+        clientes = len(stats["clientes"])
+        if ventas >= 4 and clientes >= 4:
+            inv = await get_inventory_levels(pid)
+            niveles = inv.get("inventory_levels", [])
+            stock_usa = 0
+            stock_col = 0
+            for n in niveles:
+                if LOCATION_NAME_USA in n.get("location_id", ""):
+                    stock_usa = n["available"]
+                elif LOCATION_NAME_COL in n.get("location_id", ""):
+                    stock_col = n["available"]
+
+            if stock_usa > 0 and stock_col == 0:
+                if ventas >= 13:
+                    categoria = "mas_vendido"
+                elif ventas >= 8:
+                    categoria = "alta_rotacion"
+                elif ventas >= 4:
+                    categoria = "prueba_de_rotacion"
+                else:
+                    categoria = "baja_rotacion"
+
+                productos.append({
+                    "product_id": pid,
+                    "ventas": ventas,
+                    "clientes": clientes,
+                    "stock_usa": stock_usa,
+                    "stock_col": stock_col,
+                    "categoria": categoria
+                })
+
+    return {"status": "ok", "productos": productos}
